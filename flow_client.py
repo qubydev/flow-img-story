@@ -19,7 +19,10 @@ from urllib.request import urlopen
 
 
 ORIGIN = "https://flow.google.com"
-GOOGLE_SIGN_IN = "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fwww.google.com%2F"
+# Start at Flow itself so Google can return to the product that we need to
+# verify.  The old google.com callback was too strict: Google may leave the
+# tab on flow.google.com after sign-in.
+GOOGLE_SIGN_IN = f"{ORIGIN}/"
 SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
 ASPECTS = {"1:1": 1, "9:16": 2, "16:9": 3, "3:4": 4, "4:3": 5}
 MODELS = {"Nano Banana 2 Lite": "NARWHAL", "Nano Banana Pro": "GEM_PIX_2", "Imagen (Harbor Seal)": "HARBOR_SEAL"}
@@ -103,10 +106,11 @@ class FlowClient:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
         # Start ordinary Chrome. Playwright does not launch or control the
-        # Google sign-in page; it attaches only after Google redirects home.
+        # Google sign-in page; it attaches only after a real page is available.
         process = subprocess.Popen([
             self._chrome_path(), f"--user-data-dir={self.profile}",
-            f"--remote-debugging-port={port}", "--new-window", GOOGLE_SIGN_IN,
+            f"--remote-debugging-port={port}", "--new-window",
+            "--no-first-run", "--no-default-browser-check", GOOGLE_SIGN_IN,
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         endpoint = f"http://127.0.0.1:{port}"
         browser = None
@@ -124,44 +128,65 @@ class FlowClient:
                     urls = [target.get("url", "") for target in targets if target.get("type") == "page"]
                     if any("/signin/rejected" in url for url in urls):
                         raise RuntimeError("Google rejected sign-in in Chrome. The account was not verified.")
-                    if any(re.match(r"https://(www\.)?google\.com(/|$)", url) for url in urls):
+                    # Authentication can finish on Flow, Google home, or a
+                    # Google account page that has redirected back to Flow.
+                    authenticated_host = any(
+                        re.match(r"https://([\w-]+\.)?flow\.google\.com(/|$)", url)
+                        or re.match(r"https://(www\.)?google\.com(/|$)", url)
+                        for url in urls
+                    )
+                    if authenticated_host:
                         if browser is None:
                             browser = playwright.chromium.connect_over_cdp(endpoint)
                         context = browser.contexts[0]
                         pages = context.pages
-                        home = next((page for page in pages
-                            if re.match(r"https://(www\.)?google\.com(/|$)", page.url)), None)
+                        home = next((page for page in pages if
+                            re.match(r"https://([\w-]+\.)?flow\.google\.com(/|$)", page.url)
+                            or re.match(r"https://(www\.)?google\.com(/|$)", page.url)), None)
                         if home:
-                            labels = home.locator(
-                                'a[aria-label*="Google Account"], button[aria-label*="Google Account"], '
-                                'a[href*="SignOutOptions"]')
-                            cookies = context.cookies("https://www.google.com")
-                            signed = any(c["name"] in ("SID", "__Secure-3PSID") and c.get("value")
-                                         for c in cookies)
-                            if labels.count() and signed:
+                            cookies = context.cookies([
+                                "https://flow.google.com", "https://accounts.google.com",
+                                "https://www.google.com",
+                            ])
+                            signed = any(
+                                c.get("name") in ("SID", "__Secure-3PSID", "SAPISID", "__Secure-1PSID")
+                                and c.get("value") for c in cookies
+                            )
+                            # Do not depend on an avatar/aria-label.  Those
+                            # labels vary by locale and by the current Flow UI.
+                            if signed and progress:
+                                progress("Checking Flow access…")
+                            if signed:
+                                response = context.request.get(ORIGIN, timeout=60000)
+                                if not response.ok or "accounts.google.com" in response.url:
+                                    raise RuntimeError("Google sign-in succeeded, but Flow access could not be verified.")
+                                if not re.search(r'"SNlM0e"\s*:\s*"[^"\\]+', response.text()):
+                                    raise RuntimeError("Google sign-in succeeded, but Flow did not return an active session.")
                                 email = None
-                                for label in labels.all()[:3]:
+                                for label in home.locator(
+                                    '[aria-label*="Google Account"], [aria-label*="Google konto"], '
+                                    'a[href*="SignOutOptions"]'
+                                ).all()[:3]:
                                     match = re.search(
                                         r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
                                         label.get_attribute("aria-label") or "", re.I)
                                     if match:
                                         email = match.group(0)
                                         break
-                                if progress:
-                                    progress("Checking Flow access…")
-                                response = context.request.get(ORIGIN, timeout=60000)
-                                if not response.ok or "accounts.google.com" in response.url:
-                                    raise RuntimeError("Google sign-in succeeded, but Flow access could not be verified.")
-                                if not re.search(r'"SNlM0e"\s*:\s*"[^"\\]+', response.text()):
-                                    raise RuntimeError("Google sign-in succeeded, but Flow did not return an active session.")
                                 return email
                     time.sleep(1)
                 raise RuntimeError("Google sign-in was not completed within five minutes.")
         finally:
             if browser:
-                browser.close()
+                try:
+                    browser.close()
+                except Exception:
+                    pass
             if process.poll() is None:
-                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
 
     def generate(self, prompt, model, aspect, count, seed, output):
         from playwright.sync_api import sync_playwright
